@@ -149,7 +149,9 @@ impl Middleware for SurfMiddleware<'_> {
 }
 
 #[surf::utils::async_trait]
-impl<T: CacheManager> surf::middleware::Middleware for Cache<T> {
+impl<T: CacheManager + Send + Sync + 'static> surf::middleware::Middleware
+    for Cache<T>
+{
     async fn handle(
         &self,
         req: Request,
