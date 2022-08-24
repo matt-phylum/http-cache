@@ -29,13 +29,15 @@
 //!     Ok(())
 //! }
 //! ```
+mod error;
+
 use anyhow::anyhow;
 use std::{
     collections::HashMap, convert::TryInto, str::FromStr, time::SystemTime,
 };
 
 use http::{header::CACHE_CONTROL, request, request::Parts};
-use http_cache::{CacheError, CacheManager, Middleware, Result};
+use http_cache::{BadHeader, CacheManager, Middleware, Result};
 use http_cache_semantics::CachePolicy;
 use http_types::{headers::HeaderValue, Method, Response, StatusCode, Version};
 use surf::{middleware::Next, Client, Request};
@@ -86,7 +88,7 @@ impl Middleware for SurfMiddleware<'_> {
         for header in parts.headers.iter() {
             let value = match HeaderValue::from_str(header.1.to_str()?) {
                 Ok(v) => v,
-                Err(_e) => return Err(CacheError::BadHeader),
+                Err(_e) => return Err(Box::new(BadHeader)),
             };
             self.req.set_header(header.0.as_str(), value);
         }
@@ -123,7 +125,7 @@ impl Middleware for SurfMiddleware<'_> {
         let mut res =
             match self.next.run(self.req.clone(), self.client.clone()).await {
                 Ok(r) => r,
-                Err(e) => return Err(CacheError::General(anyhow!(e))),
+                Err(e) => return Err(Box::new(error::Error::Surf(anyhow!(e)))),
             };
         let mut headers = HashMap::new();
         for header in res.iter() {
@@ -136,7 +138,7 @@ impl Middleware for SurfMiddleware<'_> {
         let version = res.version().unwrap_or(Version::Http1_1);
         let body: Vec<u8> = match res.body_bytes().await {
             Ok(b) => b,
-            Err(e) => return Err(CacheError::General(anyhow!(e))),
+            Err(e) => return Err(Box::new(error::Error::Surf(anyhow!(e)))),
         };
         Ok(HttpResponse {
             body,
@@ -159,7 +161,10 @@ impl<T: CacheManager + Send + Sync + 'static> surf::middleware::Middleware
         next: Next<'_>,
     ) -> std::result::Result<surf::Response, http_types::Error> {
         let middleware = SurfMiddleware { req, client, next };
-        let res = self.0.run(middleware).await?;
+        let res = match self.0.run(middleware).await {
+            Ok(r) => r,
+            Err(e) => return Err(http_types::Error::from(anyhow!(e))),
+        };
         let mut converted = Response::new(StatusCode::Ok);
         for header in &res.headers {
             let val = HeaderValue::from_bytes(header.1.as_bytes().to_vec())?;
