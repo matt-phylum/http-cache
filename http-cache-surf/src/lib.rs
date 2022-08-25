@@ -172,7 +172,7 @@ impl<T: CacheManager + Send + Sync + 'static> surf::middleware::Middleware
         }
         converted.set_status(res.status.try_into()?);
         converted.set_version(Some(res.version.try_into()?));
-        converted.set_body(res.body.clone());
+        converted.set_body(res.body);
         Ok(surf::Response::from(converted))
     }
 }
