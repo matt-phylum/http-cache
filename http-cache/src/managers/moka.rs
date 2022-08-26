@@ -71,12 +71,12 @@ impl CacheManager for MokaManager {
         url: &Url,
         response: HttpResponse,
         policy: CachePolicy,
-    ) -> Result<HttpResponse> {
-        let data = Store { response: response.clone(), policy };
+    ) -> Result<()> {
+        let data = Store { response, policy };
         let bytes = bincode::serialize(&data)?;
         self.cache.insert(req_key(method, url), Arc::new(bytes)).await;
         self.cache.sync();
-        Ok(response)
+        Ok(())
     }
 
     async fn delete(&self, method: &str, url: &Url) -> Result<()> {

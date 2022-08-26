@@ -60,11 +60,11 @@ impl CacheManager for CACacheManager {
         url: &Url,
         response: HttpResponse,
         policy: CachePolicy,
-    ) -> Result<HttpResponse> {
-        let data = Store { response: response.clone(), policy };
+    ) -> Result<()> {
+        let data = Store { response, policy };
         let bytes = bincode::serialize(&data)?;
         cacache::write(&self.path, &req_key(method, url), bytes).await?;
-        Ok(response)
+        Ok(())
     }
 
     async fn delete(&self, method: &str, url: &Url) -> Result<()> {

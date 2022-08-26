@@ -112,6 +112,17 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
+    /// Create a new `HttpResponse` instance
+    pub fn new(
+        body: Vec<u8>,
+        headers: HashMap<String, String>,
+        status: u16,
+        url: Url,
+        version: HttpVersion,
+    ) -> Self {
+        Self { body, headers, status, url, version }
+    }
+
     /// Returns `http::response::Parts`
     pub fn parts(&self) -> Result<response::Parts> {
         let mut converted =
@@ -194,6 +205,21 @@ impl HttpResponse {
     }
 }
 
+impl Default for HttpResponse {
+    fn default() -> Self {
+        let mut response = Self::new(
+            Vec::new(),
+            HashMap::default(),
+            500,
+            Url::parse("http://localhost").unwrap(),
+            HttpVersion::Http11,
+        );
+        response.cache_status(HitOrMiss::MISS);
+        response.cache_lookup_status(HitOrMiss::MISS);
+        response
+    }
+}
+
 /// A trait providing methods for storing, reading, and removing cache records.
 #[async_trait::async_trait]
 pub trait CacheManager {
@@ -210,36 +236,9 @@ pub trait CacheManager {
         url: &Url,
         res: HttpResponse,
         policy: CachePolicy,
-    ) -> Result<HttpResponse>;
+    ) -> Result<()>;
     /// Attempts to remove a record from cache.
     async fn delete(&self, method: &str, url: &Url) -> Result<()>;
-}
-
-/// Describes the functionality required for interfacing with HTTP client middleware
-#[async_trait::async_trait]
-pub trait Middleware {
-    /// Determines if the request method is either GET or HEAD
-    fn is_method_get_head(&self) -> bool;
-    /// Returns a new cache policy with default options
-    fn policy(&self, response: &HttpResponse) -> Result<CachePolicy>;
-    /// Returns a new cache policy with custom options
-    fn policy_with_options(
-        &self,
-        response: &HttpResponse,
-        options: CacheOptions,
-    ) -> Result<CachePolicy>;
-    /// Attempts to update the request headers with the passed `http::request::Parts`
-    fn update_headers(&mut self, parts: &request::Parts) -> Result<()>;
-    /// Attempts to force the "no-cache" directive on the request
-    fn force_no_cache(&mut self) -> Result<()>;
-    /// Attempts to construct `http::request::Parts` from the request
-    fn parts(&self) -> Result<request::Parts>;
-    /// Attempts to determine the requested url
-    fn url(&self) -> Result<Url>;
-    /// Attempts to determine the request method
-    fn method(&self) -> Result<String>;
-    /// Attempts to fetch an upstream resource and return an [`HttpResponse`]
-    async fn remote_fetch(&mut self) -> Result<HttpResponse>;
 }
 
 /// Similar to [make-fetch-happen cache options](https://github.com/npm/make-fetch-happen#--optscache).
@@ -328,6 +327,51 @@ impl From<HttpVersion> for http_types::Version {
     }
 }
 
+/// Represents next step actions to be taken as determined by the cache logic.
+#[derive(Debug)]
+pub enum Action {
+    /// Proceed with a request.
+    Remote(Fetch),
+    /// Return the cached response.
+    Cached {
+        /// The cached response.
+        response: Box<HttpResponse>,
+    },
+}
+
+/// Represents the type of fetch being performed.
+#[derive(Debug)]
+pub enum Fetch {
+    /// Proceed with a normal request.
+    Normal,
+    /// Force Cache-Control to be no-cache then proceed with a normal request.
+    ForceNoCache,
+    /// A conditional request with stages.
+    Conditional(Stage),
+}
+
+/// Represents a stage of the conditional request process.
+#[derive(Debug)]
+pub enum Stage {
+    /// Check cache logic before a conditional request.
+    BeforeFetch {
+        /// The cached response.
+        response: Box<HttpResponse>,
+        /// The cache policy that corresponds to the request.
+        policy: Box<CachePolicy>,
+    },
+    /// Return the cached response skipping the fetch.
+    Cached {
+        /// The cached response.
+        response: Box<HttpResponse>,
+    },
+    /// Update the request headers before proceeding with a conditional request.
+    UpdateRequestHeaders {
+        /// The parts used to update the request before proceeding with a conditional request.
+        request_parts: Box<request::Parts>,
+    },
+}
+
 /// Options struct provided by
 /// [`http-cache-semantics`](https://github.com/kornelski/rusty-http-cache-semantics).
 pub use http_cache_semantics::CacheOptions;
@@ -347,23 +391,41 @@ pub struct HttpCache<T: CacheManager> {
 
 #[allow(dead_code)]
 impl<T: CacheManager> HttpCache<T> {
-    /// Attempts to run the passed middleware along with the cache
-    pub async fn run(
+    fn build_policy(
         &self,
-        mut middleware: impl Middleware,
-    ) -> Result<HttpResponse> {
-        let is_cacheable = middleware.is_method_get_head()
-            && self.mode != CacheMode::NoStore
-            && self.mode != CacheMode::Reload;
+        request_parts: &request::Parts,
+        response: &HttpResponse,
+    ) -> Result<CachePolicy> {
+        let policy = match self.options {
+            Some(options) => CachePolicy::new_options(
+                request_parts,
+                &response.parts()?,
+                SystemTime::now(),
+                options,
+            ),
+            None => CachePolicy::new(request_parts, &response.parts()?),
+        };
+        Ok(policy)
+    }
+
+    /// Runs before the request is executed and returns the next action to be taken.
+    pub async fn before_request(
+        &self,
+        request_parts: &request::Parts,
+    ) -> Result<Action> {
+        let is_cacheable = request_parts.method == "GET"
+            || request_parts.method == "HEAD"
+                && self.mode != CacheMode::NoStore
+                && self.mode != CacheMode::Reload;
         if !is_cacheable {
-            return self.remote_fetch(&mut middleware).await;
+            return Ok(Action::Remote(Fetch::Normal));
         }
-        let method = middleware.method()?.to_uppercase();
-        let url = middleware.url()?;
+        let method = request_parts.method.to_string().to_uppercase();
+        let url = Url::parse(&request_parts.uri.to_string())?;
         if let Some(store) = self.manager.get(&method, &url).await? {
-            let (mut res, policy) = store;
-            res.cache_lookup_status(HitOrMiss::HIT);
-            if let Some(warning_code) = res.warning_code() {
+            let (mut response, policy) = store;
+            response.cache_lookup_status(HitOrMiss::HIT);
+            if let Some(warning_code) = response.warning_code() {
                 // https://tools.ietf.org/html/rfc7234#section-4.3.4
                 //
                 // If a stored response is selected for update, the cache MUST:
@@ -375,180 +437,152 @@ impl<T: CacheManager> HttpCache<T> {
                 //   warn-code 2xx;
                 //
                 if (100..200).contains(&warning_code) {
-                    res.remove_warning();
+                    response.remove_warning();
                 }
             }
 
             match self.mode {
                 CacheMode::Default => {
-                    self.conditional_fetch(middleware, res, policy).await
+                    Ok(Action::Remote(Fetch::Conditional(Stage::BeforeFetch {
+                        response: Box::new(response),
+                        policy: Box::new(policy),
+                    })))
                 }
-                CacheMode::NoCache => {
-                    middleware.force_no_cache()?;
-                    let mut res = self.remote_fetch(&mut middleware).await?;
-                    res.cache_lookup_status(HitOrMiss::HIT);
-                    Ok(res)
-                }
+                CacheMode::NoCache => Ok(Action::Remote(Fetch::ForceNoCache)),
                 CacheMode::ForceCache | CacheMode::OnlyIfCached => {
                     //   112 Disconnected operation
                     // SHOULD be included if the cache is intentionally disconnected from
                     // the rest of the network for a period of time.
                     // (https://tools.ietf.org/html/rfc2616#section-14.46)
-                    res.add_warning(
-                        &res.url.clone(),
+                    response.add_warning(
+                        &response.url.clone(),
                         112,
                         "Disconnected operation",
                     );
-                    res.cache_status(HitOrMiss::HIT);
-                    Ok(res)
+                    response.cache_status(HitOrMiss::HIT);
+                    Ok(Action::Cached { response: Box::new(response) })
                 }
-                _ => self.remote_fetch(&mut middleware).await,
+                _ => Ok(Action::Remote(Fetch::Normal)),
             }
         } else {
             match self.mode {
                 CacheMode::OnlyIfCached => {
                     // ENOTCACHED
-                    let mut res = HttpResponse {
-                        body: b"GatewayTimeout".to_vec(),
-                        headers: HashMap::default(),
-                        status: 504,
-                        url: middleware.url()?,
-                        version: HttpVersion::Http11,
-                    };
-                    res.cache_status(HitOrMiss::MISS);
-                    res.cache_lookup_status(HitOrMiss::MISS);
-                    Ok(res)
+                    Ok(Action::Cached {
+                        response: Box::new(HttpResponse {
+                            body: b"GatewayTimeout".to_vec(),
+                            status: 504,
+                            url,
+                            ..Default::default()
+                        }),
+                    })
                 }
-                _ => self.remote_fetch(&mut middleware).await,
+                _ => Ok(Action::Remote(Fetch::Normal)),
             }
         }
     }
 
-    async fn remote_fetch(
+    /// Runs after a remote fetch and determines what caching actions to take (if any).
+    pub async fn after_remote_fetch(
         &self,
-        middleware: &mut impl Middleware,
-    ) -> Result<HttpResponse> {
-        let mut res = middleware.remote_fetch().await?;
-        res.cache_status(HitOrMiss::MISS);
-        res.cache_lookup_status(HitOrMiss::MISS);
-        let policy = match self.options {
-            Some(options) => middleware.policy_with_options(&res, options)?,
-            None => middleware.policy(&res)?,
-        };
-        let is_get_head = middleware.is_method_get_head();
+        response: &mut HttpResponse,
+        request_parts: &request::Parts,
+    ) -> Result<()> {
+        let policy = self.build_policy(request_parts, response)?;
+        let is_get_head =
+            request_parts.method == "GET" || request_parts.method == "HEAD";
         let is_cacheable = is_get_head
             && self.mode != CacheMode::NoStore
             && self.mode != CacheMode::Reload
-            && res.status == 200
+            && response.status == 200
             && policy.is_storable();
-        let url = middleware.url()?;
-        let method = middleware.method()?.to_uppercase();
+        let url = Url::parse(&request_parts.uri.to_string())?;
+        let method = request_parts.method.to_string().to_uppercase();
         if is_cacheable {
-            Ok(self.manager.put(&method, &url, res, policy).await?)
+            self.manager.put(&method, &url, response.clone(), policy).await?;
         } else if !is_get_head {
             self.manager.delete("GET", &url).await.ok();
-            Ok(res)
-        } else {
-            Ok(res)
+        }
+        Ok(())
+    }
+
+    /// Runs before a conditional fetch to determine freshness of the cached response.
+    /// If the response is fresh, the conditional fetch logic will process immediately.
+    /// If the response is not fresh, the conditional fetch logic is to continue after the request headers are updated.
+    pub fn before_conditional_fetch(
+        &self,
+        request_parts: &request::Parts,
+        mut cached_response: HttpResponse,
+        policy: CachePolicy,
+    ) -> Result<Stage> {
+        let before_req =
+            policy.before_request(request_parts, SystemTime::now());
+        match before_req {
+            BeforeRequest::Fresh(parts) => {
+                cached_response.update_headers(&parts)?;
+                cached_response.cache_status(HitOrMiss::HIT);
+                cached_response.cache_lookup_status(HitOrMiss::HIT);
+                Ok(Stage::Cached { response: Box::new(cached_response) })
+            }
+            BeforeRequest::Stale { request: parts, matches: _ } => {
+                Ok(Stage::UpdateRequestHeaders {
+                    request_parts: Box::new(parts),
+                })
+            }
         }
     }
 
-    async fn conditional_fetch(
+    /// Runs after a conditional fetch and determines what caching actions to take (if any).
+    pub async fn after_conditional_fetch(
         &self,
-        mut middleware: impl Middleware,
-        mut cached_res: HttpResponse,
+        request_parts: &request::Parts,
+        mut cached_response: HttpResponse,
+        mut conditional_response: HttpResponse,
         mut policy: CachePolicy,
     ) -> Result<HttpResponse> {
-        let before_req =
-            policy.before_request(&middleware.parts()?, SystemTime::now());
-        match before_req {
-            BeforeRequest::Fresh(parts) => {
-                cached_res.update_headers(&parts)?;
-                cached_res.cache_status(HitOrMiss::HIT);
-                cached_res.cache_lookup_status(HitOrMiss::HIT);
-                return Ok(cached_res);
-            }
-            BeforeRequest::Stale { request: parts, matches } => {
-                if matches {
-                    middleware.update_headers(&parts)?;
+        let url = Url::parse(&request_parts.uri.to_string())?;
+        let method = request_parts.method.to_string().to_uppercase();
+        let status = StatusCode::from_u16(conditional_response.status)?;
+        if status.is_server_error() && cached_response.must_revalidate() {
+            //   111 Revalidation failed
+            //   MUST be included if a cache returns a stale response
+            //   because an attempt to revalidate the response failed,
+            //   due to an inability to reach the server.
+            // (https://tools.ietf.org/html/rfc2616#section-14.46)
+            cached_response.add_warning(&url, 111, "Revalidation failed");
+            cached_response.cache_status(HitOrMiss::HIT);
+            Ok(cached_response)
+        } else if conditional_response.status == 304 {
+            let after_res = policy.after_response(
+                request_parts,
+                &conditional_response.parts()?,
+                SystemTime::now(),
+            );
+            match after_res {
+                AfterResponse::Modified(new_policy, parts)
+                | AfterResponse::NotModified(new_policy, parts) => {
+                    policy = new_policy;
+                    cached_response.update_headers(&parts)?;
                 }
             }
-        }
-        let req_url = middleware.url()?;
-        match middleware.remote_fetch().await {
-            Ok(mut cond_res) => {
-                let status = StatusCode::from_u16(cond_res.status)?;
-                if status.is_server_error() && cached_res.must_revalidate() {
-                    //   111 Revalidation failed
-                    //   MUST be included if a cache returns a stale response
-                    //   because an attempt to revalidate the response failed,
-                    //   due to an inability to reach the server.
-                    // (https://tools.ietf.org/html/rfc2616#section-14.46)
-                    cached_res.add_warning(
-                        &req_url,
-                        111,
-                        "Revalidation failed",
-                    );
-                    cached_res.cache_status(HitOrMiss::HIT);
-                    Ok(cached_res)
-                } else if cond_res.status == 304 {
-                    let after_res = policy.after_response(
-                        &middleware.parts()?,
-                        &cond_res.parts()?,
-                        SystemTime::now(),
-                    );
-                    match after_res {
-                        AfterResponse::Modified(new_policy, parts)
-                        | AfterResponse::NotModified(new_policy, parts) => {
-                            policy = new_policy;
-                            cached_res.update_headers(&parts)?;
-                        }
-                    }
-                    cached_res.cache_status(HitOrMiss::HIT);
-                    cached_res.cache_lookup_status(HitOrMiss::HIT);
-                    let method = middleware.method()?.to_uppercase();
-                    let res = self
-                        .manager
-                        .put(&method, &req_url, cached_res, policy)
-                        .await?;
-                    Ok(res)
-                } else if cond_res.status == 200 {
-                    let policy = match self.options {
-                        Some(options) => middleware
-                            .policy_with_options(&cond_res, options)?,
-                        None => middleware.policy(&cond_res)?,
-                    };
-                    cond_res.cache_status(HitOrMiss::MISS);
-                    cond_res.cache_lookup_status(HitOrMiss::HIT);
-                    let method = middleware.method()?.to_uppercase();
-                    let res = self
-                        .manager
-                        .put(&method, &req_url, cond_res, policy)
-                        .await?;
-                    Ok(res)
-                } else {
-                    cached_res.cache_status(HitOrMiss::HIT);
-                    Ok(cached_res)
-                }
-            }
-            Err(e) => {
-                if cached_res.must_revalidate() {
-                    Err(e)
-                } else {
-                    //   111 Revalidation failed
-                    //   MUST be included if a cache returns a stale response
-                    //   because an attempt to revalidate the response failed,
-                    //   due to an inability to reach the server.
-                    // (https://tools.ietf.org/html/rfc2616#section-14.46)
-                    cached_res.add_warning(
-                        &req_url,
-                        111,
-                        "Revalidation failed",
-                    );
-                    cached_res.cache_status(HitOrMiss::HIT);
-                    Ok(cached_res)
-                }
-            }
+            cached_response.cache_status(HitOrMiss::HIT);
+            cached_response.cache_lookup_status(HitOrMiss::HIT);
+            self.manager
+                .put(&method, &url, cached_response.clone(), policy)
+                .await?;
+            Ok(cached_response.clone())
+        } else if conditional_response.status == 200 {
+            let policy =
+                self.build_policy(request_parts, &conditional_response)?;
+            conditional_response.cache_status(HitOrMiss::MISS);
+            conditional_response.cache_lookup_status(HitOrMiss::HIT);
+            self.manager
+                .put(&method, &url, conditional_response.clone(), policy)
+                .await?;
+            Ok(conditional_response)
+        } else {
+            cached_response.cache_status(HitOrMiss::HIT);
+            Ok(cached_response)
         }
     }
 }
