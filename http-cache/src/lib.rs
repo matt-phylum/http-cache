@@ -485,7 +485,7 @@ impl<T: CacheManager> HttpCache<T> {
     /// Runs after a remote fetch and determines what caching actions to take (if any).
     pub async fn after_remote_fetch(
         &self,
-        response: &mut HttpResponse,
+        response: &HttpResponse,
         request_parts: &request::Parts,
     ) -> Result<()> {
         let policy = self.build_policy(request_parts, response)?;
@@ -540,6 +540,8 @@ impl<T: CacheManager> HttpCache<T> {
         mut conditional_response: HttpResponse,
         mut policy: CachePolicy,
     ) -> Result<HttpResponse> {
+        cached_response.cache_lookup_status(HitOrMiss::HIT);
+        conditional_response.cache_lookup_status(HitOrMiss::HIT);
         let url = Url::parse(&request_parts.uri.to_string())?;
         let method = request_parts.method.to_string().to_uppercase();
         let status = StatusCode::from_u16(conditional_response.status)?;
@@ -566,7 +568,6 @@ impl<T: CacheManager> HttpCache<T> {
                 }
             }
             cached_response.cache_status(HitOrMiss::HIT);
-            cached_response.cache_lookup_status(HitOrMiss::HIT);
             self.manager
                 .put(&method, &url, cached_response.clone(), policy)
                 .await?;
@@ -575,7 +576,6 @@ impl<T: CacheManager> HttpCache<T> {
             let policy =
                 self.build_policy(request_parts, &conditional_response)?;
             conditional_response.cache_status(HitOrMiss::MISS);
-            conditional_response.cache_lookup_status(HitOrMiss::HIT);
             self.manager
                 .put(&method, &url, conditional_response.clone(), policy)
                 .await?;

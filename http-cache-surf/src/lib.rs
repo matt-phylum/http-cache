@@ -35,9 +35,7 @@ use anyhow::anyhow;
 use std::{convert::TryInto, str::FromStr};
 
 use http::{header::CACHE_CONTROL, request};
-use http_cache::{
-    Action, BadHeader, CacheManager, Fetch, HitOrMiss, Result, Stage,
-};
+use http_cache::{Action, BadHeader, CacheManager, Fetch, Result, Stage};
 use http_types::{headers::HeaderValue, Response, StatusCode, Version};
 use surf::{middleware::Next, Client, Request};
 use url::Url;
@@ -126,23 +124,20 @@ impl<T: CacheManager + Send + Sync + 'static> surf::middleware::Middleware
                 Action::Remote(fetch) => match fetch {
                     Fetch::Normal => {
                         let res = next.run(req, client).await?;
-                        let mut response =
-                            match convert_from_http_types_response(
-                                res.into(),
-                                url,
-                            )
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    return Err(http_types::Error::from(
-                                        anyhow!(e),
-                                    ))
-                                }
-                            };
+                        let response = match convert_from_http_types_response(
+                            res.into(),
+                            url,
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return Err(http_types::Error::from(anyhow!(e)))
+                            }
+                        };
                         match self
                             .0
-                            .after_remote_fetch(&mut response, &request_parts)
+                            .after_remote_fetch(&response, &request_parts)
                             .await
                         {
                             Ok(r) => r,
@@ -171,9 +166,11 @@ impl<T: CacheManager + Send + Sync + 'static> surf::middleware::Middleware
                                     ))
                                 }
                             };
+                        response
+                            .cache_lookup_status(http_cache::HitOrMiss::HIT);
                         match self
                             .0
-                            .after_remote_fetch(&mut response, &request_parts)
+                            .after_remote_fetch(&response, &request_parts)
                             .await
                         {
                             Ok(r) => r,
@@ -181,7 +178,6 @@ impl<T: CacheManager + Send + Sync + 'static> surf::middleware::Middleware
                                 return Err(http_types::Error::from(anyhow!(e)))
                             }
                         };
-                        response.cache_lookup_status(HitOrMiss::HIT);
                         let converted =
                             convert_to_http_types_response(response)?;
                         return Ok(surf::Response::from(converted));

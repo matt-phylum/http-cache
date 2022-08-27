@@ -44,7 +44,7 @@ use http::{
     header::{HeaderName, CACHE_CONTROL},
     HeaderValue,
 };
-use http_cache::{Action, CacheManager, Fetch, HitOrMiss, Result, Stage};
+use http_cache::{Action, CacheManager, Fetch, Result, Stage};
 use reqwest::{Request, Response, ResponseBuilderExt};
 use reqwest_middleware::{Error, Next};
 use task_local_extensions::Extensions;
@@ -139,7 +139,7 @@ impl<T: CacheManager + Send + Sync + 'static> reqwest_middleware::Middleware
                     Fetch::Normal => {
                         let copied_req = clone_req(&req)?;
                         let res = next.run(copied_req, extensions).await?;
-                        let mut response =
+                        let response =
                             match convert_from_reqwest_response(res, url).await
                             {
                                 Ok(r) => r,
@@ -149,7 +149,7 @@ impl<T: CacheManager + Send + Sync + 'static> reqwest_middleware::Middleware
                             };
                         match self
                             .0
-                            .after_remote_fetch(&mut response, &request_parts)
+                            .after_remote_fetch(&response, &request_parts)
                             .await
                         {
                             Ok(r) => r,
@@ -179,7 +179,7 @@ impl<T: CacheManager + Send + Sync + 'static> reqwest_middleware::Middleware
                             };
                         match self
                             .0
-                            .after_remote_fetch(&mut response, &request_parts)
+                            .after_remote_fetch(&response, &request_parts)
                             .await
                         {
                             Ok(r) => r,
@@ -187,7 +187,8 @@ impl<T: CacheManager + Send + Sync + 'static> reqwest_middleware::Middleware
                                 return Err(Error::Middleware(anyhow!(e)))
                             }
                         };
-                        response.cache_lookup_status(HitOrMiss::HIT);
+                        response
+                            .cache_lookup_status(http_cache::HitOrMiss::HIT);
                         let converted = convert_to_reqwest_response(response)?;
                         return Ok(converted);
                     }
