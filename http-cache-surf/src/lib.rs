@@ -35,7 +35,9 @@ use anyhow::anyhow;
 use std::{convert::TryInto, str::FromStr};
 
 use http::{header::CACHE_CONTROL, request};
-use http_cache::{Action, BadHeader, CacheManager, Fetch, Result, Stage};
+use http_cache::{
+    Action, BadHeader, BoxError, CacheManager, Fetch, Result, Stage,
+};
 use http_types::{headers::HeaderValue, Response, StatusCode, Version};
 use surf::{middleware::Next, Client, Request};
 use url::Url;
@@ -54,7 +56,7 @@ pub use http_cache::{MokaCache, MokaCacheBuilder, MokaManager};
 #[derive(Debug)]
 pub struct Cache<T: CacheManager>(pub HttpCache<T>);
 
-async fn convert_from_http_types_response(
+async fn from_http_types_response(
     mut response: Response,
     url: Url,
 ) -> Result<HttpResponse> {
@@ -68,15 +70,11 @@ async fn convert_from_http_types_response(
     converted.status = response.status().into();
     converted.version =
         response.version().unwrap_or(Version::Http1_1).try_into()?;
-    let body: Vec<u8> = match response.body_bytes().await {
-        Ok(b) => b,
-        Err(e) => return Err(Box::new(error::Error::Surf(anyhow!(e)))),
-    };
-    converted.body = body;
+    converted.body = response.body_bytes().await?;
     Ok(converted)
 }
 
-fn convert_to_http_types_response(
+fn to_http_types_response(
     response: HttpResponse,
 ) -> std::result::Result<Response, http_types::Error> {
     let mut converted = Response::new(StatusCode::Ok);
@@ -88,6 +86,10 @@ fn convert_to_http_types_response(
     converted.set_version(Some(response.version.try_into()?));
     converted.set_body(response.body);
     Ok(converted)
+}
+
+fn to_http_types_error(e: BoxError) -> http_types::Error {
+    http_types::Error::from(anyhow!(e))
 }
 
 #[surf::utils::async_trait]
@@ -115,159 +117,105 @@ impl<T: CacheManager + Send + Sync + 'static> surf::middleware::Middleware
         }
         let request_parts = converted.into_parts().0;
         let url = req.url().clone();
-        match self.0.before_request(&request_parts).await {
-            Ok(action) => match action {
-                Action::Cached { response } => {
-                    let converted = convert_to_http_types_response(*response)?;
-                    Ok(surf::Response::from(converted))
-                }
-                Action::Remote(fetch) => match fetch {
-                    Fetch::Normal => {
-                        let res = next.run(req, client).await?;
-                        let response = match convert_from_http_types_response(
-                            res.into(),
-                            url,
-                        )
+        let action = self
+            .0
+            .before_request(&request_parts)
+            .await
+            .map_err(to_http_types_error)?;
+        match action {
+            Action::Cached { response } => {
+                let converted = to_http_types_response(*response)?;
+                Ok(surf::Response::from(converted))
+            }
+            Action::Remote(fetch) => match fetch {
+                Fetch::Normal => {
+                    let res = next.run(req, client).await?;
+                    let response = from_http_types_response(res.into(), url)
                         .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                return Err(http_types::Error::from(anyhow!(e)))
-                            }
-                        };
-                        match self
+                        .map_err(to_http_types_error)?;
+                    self.0
+                        .after_remote_fetch(&response, &request_parts)
+                        .await
+                        .map_err(to_http_types_error)?;
+                    let converted = to_http_types_response(response)?;
+                    return Ok(surf::Response::from(converted));
+                }
+                Fetch::ForceNoCache => {
+                    req.insert_header(CACHE_CONTROL.as_str(), "no-cache");
+                    let res = next.run(req, client).await?;
+                    let mut response =
+                        from_http_types_response(res.into(), url)
+                            .await
+                            .map_err(to_http_types_error)?;
+                    response.cache_lookup_status(http_cache::HitOrMiss::HIT);
+                    self.0
+                        .after_remote_fetch(&response, &request_parts)
+                        .await
+                        .map_err(to_http_types_error)?;
+                    let converted = to_http_types_response(response)?;
+                    return Ok(surf::Response::from(converted));
+                }
+                Fetch::Conditional(stage) => match stage {
+                    Stage::BeforeFetch { response, policy } => {
+                        let next_stage = self
                             .0
-                            .after_remote_fetch(&response, &request_parts)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                return Err(http_types::Error::from(anyhow!(e)))
-                            }
-                        };
-                        let converted =
-                            convert_to_http_types_response(response)?;
-                        return Ok(surf::Response::from(converted));
-                    }
-                    Fetch::ForceNoCache => {
-                        req.insert_header(CACHE_CONTROL.as_str(), "no-cache");
-                        let res = next.run(req, client).await?;
-                        let mut response =
-                            match convert_from_http_types_response(
-                                res.into(),
-                                url,
-                            )
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    return Err(http_types::Error::from(
-                                        anyhow!(e),
-                                    ))
-                                }
-                            };
-                        response
-                            .cache_lookup_status(http_cache::HitOrMiss::HIT);
-                        match self
-                            .0
-                            .after_remote_fetch(&response, &request_parts)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                return Err(http_types::Error::from(anyhow!(e)))
-                            }
-                        };
-                        let converted =
-                            convert_to_http_types_response(response)?;
-                        return Ok(surf::Response::from(converted));
-                    }
-                    Fetch::Conditional(stage) => match stage {
-                        Stage::BeforeFetch { response, policy } => {
-                            match self.0.before_conditional_fetch(
+                            .before_conditional_fetch(
                                 &request_parts,
                                 *response.clone(),
                                 *policy.clone(),
-                            ) {
-                                Ok(stage) => {
-                                    match stage {
-                                        Stage::Cached { response } => {
-                                            let converted =
-                                                convert_to_http_types_response(
-                                                    *response,
-                                                )?;
-                                            return Ok(surf::Response::from(
-                                                converted,
-                                            ));
-                                        }
-                                        Stage::UpdateRequestHeaders {
-                                            request_parts,
-                                        } => {
-                                            for header in
-                                                request_parts.headers.iter()
-                                            {
-                                                let value = match HeaderValue::from_str(header.1.to_str()?) {
-                                                    Ok(v) => v,
-                                                    Err(_e) => return Err(http_types::Error::from(BadHeader)),
-                                                };
-                                                req.set_header(
-                                                    header.0.as_str(),
-                                                    value,
-                                                );
-                                            }
-                                            let res =
-                                                next.run(req, client).await?;
-                                            let conditional_response = match convert_from_http_types_response(res.into(), url).await {
-                                                    Ok(r) => r,
-                                                    Err(e) => return Err(http_types::Error::from(anyhow!(e))),
-                                                };
-                                            let response =
-                                                match self
-                                                    .0
-                                                    .after_conditional_fetch(
-                                                        &request_parts,
-                                                        *response.clone(),
-                                                        conditional_response,
-                                                        *policy,
+                            )
+                            .map_err(to_http_types_error)?;
+                        match next_stage {
+                            Stage::Cached { response } => {
+                                let converted =
+                                    to_http_types_response(*response)?;
+                                return Ok(surf::Response::from(converted));
+                            }
+                            Stage::UpdateRequestHeaders { request_parts } => {
+                                for header in request_parts.headers.iter() {
+                                    req.set_header(
+                                        header.0.as_str(),
+                                        HeaderValue::from_str(
+                                            header.1.to_str().map_err(
+                                                |_e| {
+                                                    to_http_types_error(
+                                                        Box::new(BadHeader),
                                                     )
-                                                    .await
-                                                {
-                                                    Ok(r) => r,
-                                                    Err(e) => return Err(
-                                                        http_types::Error::from(
-                                                            anyhow!(e),
-                                                        ),
-                                                    ),
-                                                };
-                                            let converted =
-                                                convert_to_http_types_response(
-                                                    response,
-                                                )?;
-                                            return Ok(surf::Response::from(
-                                                converted,
-                                            ));
-                                        }
-                                        Stage::BeforeFetch {
-                                            response: _,
-                                            policy: _,
-                                        } => unreachable!(),
-                                    }
+                                                },
+                                            )?,
+                                        )?,
+                                    );
                                 }
-                                Err(e) => {
-                                    return Err(http_types::Error::from(
-                                        anyhow!(e),
-                                    ))
-                                }
+                                let res = next.run(req, client).await?;
+                                let conditional_response =
+                                    from_http_types_response(res.into(), url)
+                                        .await
+                                        .map_err(to_http_types_error)?;
+                                let response = self
+                                    .0
+                                    .after_conditional_fetch(
+                                        &request_parts,
+                                        *response.clone(),
+                                        conditional_response,
+                                        *policy,
+                                    )
+                                    .await
+                                    .map_err(to_http_types_error)?;
+                                let converted =
+                                    to_http_types_response(response)?;
+                                return Ok(surf::Response::from(converted));
+                            }
+                            Stage::BeforeFetch { response: _, policy: _ } => {
+                                unreachable!()
                             }
                         }
-                        Stage::Cached { response: _ } => unreachable!(),
-                        Stage::UpdateRequestHeaders { request_parts: _ } => {
-                            unreachable!()
-                        }
-                    },
+                    }
+                    Stage::Cached { response: _ } => unreachable!(),
+                    Stage::UpdateRequestHeaders { request_parts: _ } => {
+                        unreachable!()
+                    }
                 },
             },
-            Err(e) => return Err(http_types::Error::from(anyhow!(e))),
         }
     }
 }

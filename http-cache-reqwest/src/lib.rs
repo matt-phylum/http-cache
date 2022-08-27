@@ -44,7 +44,7 @@ use http::{
     header::{HeaderName, CACHE_CONTROL},
     HeaderValue,
 };
-use http_cache::{Action, CacheManager, Fetch, Result, Stage};
+use http_cache::{Action, BoxError, CacheManager, Fetch, Result, Stage};
 use reqwest::{Request, Response, ResponseBuilderExt};
 use reqwest_middleware::{Error, Next};
 use task_local_extensions::Extensions;
@@ -112,6 +112,10 @@ fn clone_req(request: &Request) -> std::result::Result<Request, Error> {
     }
 }
 
+fn to_middleware_error(e: BoxError) -> Error {
+    Error::Middleware(anyhow!(e))
+}
+
 #[async_trait::async_trait]
 impl<T: CacheManager + Send + Sync + 'static> reqwest_middleware::Middleware
     for Cache<T>
@@ -123,153 +127,104 @@ impl<T: CacheManager + Send + Sync + 'static> reqwest_middleware::Middleware
         next: Next<'_>,
     ) -> std::result::Result<Response, Error> {
         let copied_req = clone_req(&req)?;
-        let converted = match http::Request::try_from(copied_req) {
-            Ok(r) => r,
-            Err(e) => return Err(Error::Middleware(anyhow!(e))),
-        };
+        let converted = http::Request::try_from(copied_req)?;
         let request_parts = converted.into_parts().0;
         let url = req.url().clone();
-        match self.0.before_request(&request_parts).await {
-            Ok(action) => match action {
-                Action::Cached { response } => {
-                    let converted = convert_to_reqwest_response(*response)?;
-                    Ok(converted)
+        let action = self
+            .0
+            .before_request(&request_parts)
+            .await
+            .map_err(to_middleware_error)?;
+        match action {
+            Action::Cached { response } => {
+                let converted = convert_to_reqwest_response(*response)?;
+                Ok(converted)
+            }
+            Action::Remote(fetch) => match fetch {
+                Fetch::Normal => {
+                    let copied_req = clone_req(&req)?;
+                    let res = next.run(copied_req, extensions).await?;
+                    let response = convert_from_reqwest_response(res, url)
+                        .await
+                        .map_err(to_middleware_error)?;
+                    self.0
+                        .after_remote_fetch(&response, &request_parts)
+                        .await
+                        .map_err(to_middleware_error)?;
+                    let converted = convert_to_reqwest_response(response)?;
+                    return Ok(converted);
                 }
-                Action::Remote(fetch) => match fetch {
-                    Fetch::Normal => {
-                        let copied_req = clone_req(&req)?;
-                        let res = next.run(copied_req, extensions).await?;
-                        let response =
-                            match convert_from_reqwest_response(res, url).await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    return Err(Error::Middleware(anyhow!(e)))
-                                }
-                            };
-                        match self
+                Fetch::ForceNoCache => {
+                    req.headers_mut().insert(
+                        CACHE_CONTROL.as_str(),
+                        HeaderValue::from_str("no-cache")
+                            .map_err(|e| to_middleware_error(Box::new(e)))?,
+                    );
+                    let res = next.run(req, extensions).await?;
+                    let mut response = convert_from_reqwest_response(res, url)
+                        .await
+                        .map_err(to_middleware_error)?;
+                    self.0
+                        .after_remote_fetch(&response, &request_parts)
+                        .await
+                        .map_err(to_middleware_error)?;
+                    response.cache_lookup_status(http_cache::HitOrMiss::HIT);
+                    let converted = convert_to_reqwest_response(response)?;
+                    return Ok(converted);
+                }
+                Fetch::Conditional(stage) => match stage {
+                    Stage::BeforeFetch { response, policy } => {
+                        let next_stage = self
                             .0
-                            .after_remote_fetch(&response, &request_parts)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                return Err(Error::Middleware(anyhow!(e)))
-                            }
-                        };
-                        let converted = convert_to_reqwest_response(response)?;
-                        return Ok(converted);
-                    }
-                    Fetch::ForceNoCache => {
-                        let v = match HeaderValue::from_str("no-cache") {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return Err(Error::Middleware(anyhow!(e)))
-                            }
-                        };
-                        req.headers_mut().insert(CACHE_CONTROL.as_str(), v);
-                        let res = next.run(req, extensions).await?;
-                        let mut response =
-                            match convert_from_reqwest_response(res, url).await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    return Err(Error::Middleware(anyhow!(e)))
-                                }
-                            };
-                        match self
-                            .0
-                            .after_remote_fetch(&response, &request_parts)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                return Err(Error::Middleware(anyhow!(e)))
-                            }
-                        };
-                        response
-                            .cache_lookup_status(http_cache::HitOrMiss::HIT);
-                        let converted = convert_to_reqwest_response(response)?;
-                        return Ok(converted);
-                    }
-                    Fetch::Conditional(stage) => match stage {
-                        Stage::BeforeFetch { response, policy } => {
-                            match self.0.before_conditional_fetch(
+                            .before_conditional_fetch(
                                 &request_parts,
                                 *response.clone(),
                                 *policy.clone(),
-                            ) {
-                                Ok(stage) => {
-                                    match stage {
-                                        Stage::Cached { response } => {
-                                            let converted =
-                                                convert_to_reqwest_response(
-                                                    *response,
-                                                )?;
-                                            return Ok(converted);
-                                        }
-                                        Stage::UpdateRequestHeaders {
-                                            request_parts,
-                                        } => {
-                                            for header in
-                                                request_parts.headers.iter()
-                                            {
-                                                req.headers_mut().insert(
-                                                    header.0.clone(),
-                                                    HeaderValue::from(header.1),
-                                                );
-                                            }
-                                            let res = next
-                                                .run(req, extensions)
-                                                .await?;
-                                            let conditional_response = match convert_from_reqwest_response(res, url).await {
-                                                    Ok(r) => r,
-                                                    Err(e) => return Err(Error::Middleware(anyhow!(e))),
-                                                };
-                                            let response = match self
-                                                .0
-                                                .after_conditional_fetch(
-                                                    &request_parts,
-                                                    *response.clone(),
-                                                    conditional_response,
-                                                    *policy,
-                                                )
-                                                .await
-                                            {
-                                                Ok(r) => r,
-                                                Err(e) => {
-                                                    return Err(
-                                                        Error::Middleware(
-                                                            anyhow!(e),
-                                                        ),
-                                                    )
-                                                }
-                                            };
-                                            let converted =
-                                                convert_to_reqwest_response(
-                                                    response,
-                                                )?;
-                                            return Ok(converted);
-                                        }
-                                        Stage::BeforeFetch {
-                                            response: _,
-                                            policy: _,
-                                        } => unreachable!(),
-                                    }
+                            )
+                            .map_err(to_middleware_error)?;
+                        match next_stage {
+                            Stage::Cached { response } => {
+                                let converted =
+                                    convert_to_reqwest_response(*response)?;
+                                return Ok(converted);
+                            }
+                            Stage::UpdateRequestHeaders { request_parts } => {
+                                for header in request_parts.headers.iter() {
+                                    req.headers_mut().insert(
+                                        header.0.clone(),
+                                        HeaderValue::from(header.1),
+                                    );
                                 }
-                                Err(e) => {
-                                    return Err(Error::Middleware(anyhow!(e)))
-                                }
+                                let res = next.run(req, extensions).await?;
+                                let conditional_response =
+                                    convert_from_reqwest_response(res, url)
+                                        .await
+                                        .map_err(to_middleware_error)?;
+                                let response = self
+                                    .0
+                                    .after_conditional_fetch(
+                                        &request_parts,
+                                        *response.clone(),
+                                        conditional_response,
+                                        *policy,
+                                    )
+                                    .await
+                                    .map_err(to_middleware_error)?;
+                                let converted =
+                                    convert_to_reqwest_response(response)?;
+                                return Ok(converted);
+                            }
+                            Stage::BeforeFetch { response: _, policy: _ } => {
+                                unreachable!()
                             }
                         }
-                        Stage::Cached { response: _ } => unreachable!(),
-                        Stage::UpdateRequestHeaders { request_parts: _ } => {
-                            unreachable!()
-                        }
-                    },
+                    }
+                    Stage::Cached { response: _ } => unreachable!(),
+                    Stage::UpdateRequestHeaders { request_parts: _ } => {
+                        unreachable!()
+                    }
                 },
             },
-            Err(e) => return Err(Error::Middleware(anyhow!(e))),
         }
     }
 }
