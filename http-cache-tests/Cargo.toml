@@ -17,6 +17,8 @@ surf = "2.3.2"
 tokio = { version = "1.20.1", features = ["macros", "rt-multi-thread"] }
 url = "2.2.2"
 wiremock = "0.5.14"
+tower = "0.4.13"
+hyper = { version = "0.14.20", features = ["client"] }
 
 [dependencies.http-cache]
 path = "../http-cache"
@@ -30,3 +32,7 @@ version = "0.6.0"
 [dependencies.http-cache-surf]
 path = "../http-cache-surf"
 version = "0.6.0"
+
+[dependencies.http-cache-tower]
+path = "../http-cache-tower"
+version = "0.1.0"
