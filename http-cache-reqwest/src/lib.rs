@@ -174,7 +174,6 @@ impl Middleware for ReqwestMiddleware<'_> {
     }
 }
 
-// Converts an [`HttpResponse`] to a reqwest [`Response`]
 fn convert_response(response: HttpResponse) -> anyhow::Result<Response> {
     let mut ret_res = http::Response::builder()
         .status(response.status)
@@ -187,6 +186,7 @@ fn convert_response(response: HttpResponse) -> anyhow::Result<Response> {
             HeaderValue::from_str(header.1.clone().as_str())?,
         );
     }
+
     Ok(Response::from(ret_res))
 }
 
@@ -202,7 +202,13 @@ impl<T: CacheManager> reqwest_middleware::Middleware for Cache<T> {
         let middleware = ReqwestMiddleware { req, next, extensions };
         let res = match self.0.run(middleware).await {
             Ok(r) => r,
-            Err(e) => return Err(Error::Middleware(anyhow::anyhow!(e))),
+            Err(e) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                return Err(Error::Middleware(anyhow::anyhow!(e)));
+                // Not sure if this is the best way to handle this
+                #[cfg(target_arch = "wasm32")]
+                return Err(Error::Middleware(anyhow::anyhow!(e.to_string())));
+            },
         };
         let converted = convert_response(res)?;
         Ok(converted)
