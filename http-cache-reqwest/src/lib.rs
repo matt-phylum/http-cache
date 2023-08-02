@@ -152,7 +152,13 @@ impl Middleware for ReqwestMiddleware<'_> {
         }
         let url = res.url().clone();
         let status = res.status().into();
+
+        #[cfg(not(target_arch = "wasm32"))]
         let version = res.version();
+        // We can't get this on wasm32 atm so we just set it to HTTP/1.1
+        #[cfg(target_arch = "wasm32")]
+        let version = http::Version::HTTP_11;
+        
         let body: Vec<u8> = match res.bytes().await {
             Ok(b) => b,
             Err(e) => return Err(Box::new(e)),
