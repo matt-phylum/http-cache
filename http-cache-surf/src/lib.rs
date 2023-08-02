@@ -68,7 +68,8 @@ pub(crate) struct SurfMiddleware<'a> {
     pub next: Next<'a>,
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl Middleware for SurfMiddleware<'_> {
     fn is_method_get_head(&self) -> bool {
         self.req.method() == Method::Get || self.req.method() == Method::Head
@@ -152,7 +153,8 @@ fn to_http_types_error(e: BoxError) -> http_types::Error {
     http_types::Error::from(anyhow!(e))
 }
 
-#[surf::utils::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<T: CacheManager> surf::middleware::Middleware for Cache<T> {
     async fn handle(
         &self,

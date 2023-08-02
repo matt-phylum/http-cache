@@ -215,8 +215,9 @@ impl HttpResponse {
 }
 
 /// A trait providing methods for storing, reading, and removing cache records.
-#[async_trait::async_trait]
-pub trait CacheManager: Send + Sync + 'static {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait CacheManager: 'static + Send + Sync {
     /// Attempts to pull a cached response and related policy from cache.
     async fn get(
         &self,
@@ -234,8 +235,9 @@ pub trait CacheManager: Send + Sync + 'static {
 }
 
 /// Describes the functionality required for interfacing with HTTP client middleware
-#[async_trait::async_trait]
-pub trait Middleware: Send {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait Middleware {
     /// Determines if the request method is either GET or HEAD
     fn is_method_get_head(&self) -> bool;
     /// Returns a new cache policy with default options

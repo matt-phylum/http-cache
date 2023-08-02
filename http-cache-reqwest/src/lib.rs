@@ -89,7 +89,8 @@ fn clone_req(request: &Request) -> std::result::Result<Request, Error> {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl Middleware for ReqwestMiddleware<'_> {
     fn is_method_get_head(&self) -> bool {
         self.req.method() == Method::GET || self.req.method() == Method::HEAD
@@ -183,7 +184,8 @@ fn convert_response(response: HttpResponse) -> anyhow::Result<Response> {
     Ok(Response::from(ret_res))
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<T: CacheManager> reqwest_middleware::Middleware for Cache<T> {
     async fn handle(
         &self,

@@ -1,7 +1,12 @@
 use std::fmt;
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Generic error type for the `HttpCache` middleware.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+#[cfg(target_arch = "wasm32")]
+/// Generic error type for the `HttpCache` middleware.
+pub type BoxError = Box<dyn std::error::Error>;
 
 /// A `Result` typedef to use with the [`BoxError`] type
 pub type Result<T> = std::result::Result<T, BoxError>;
