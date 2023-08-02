@@ -186,7 +186,9 @@ fn convert_response(response: HttpResponse) -> anyhow::Result<Response> {
             HeaderValue::from_str(header.1.clone().as_str())?,
         );
     }
-
+    // Doesn't appear to be possible to do this for wasm32 atm
+    // https://github.com/seanmonstar/reqwest/pull/1920
+    // Need to be able to convert from http::Response to reqwest::Response when the wasm::response::Response type is being used
     Ok(Response::from(ret_res))
 }
 
